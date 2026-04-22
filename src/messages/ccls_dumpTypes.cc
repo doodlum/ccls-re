@@ -42,13 +42,14 @@ REFLECT_STRUCT(CcleFieldInfo, name, offset, size, qualType, typeUsr);
 struct CcleMethodInfo {
   std::string qualName;
   std::string shortName;
+  std::string signature;
   bool isVirtual = false;
   bool isPure = false;
   bool isStatic = false;
   int32_t vtableIndex = -1;
   Usr usr = 0;
 };
-REFLECT_STRUCT(CcleMethodInfo, qualName, shortName, isVirtual, isPure, isStatic,
+REFLECT_STRUCT(CcleMethodInfo, qualName, shortName, signature, isVirtual, isPure, isStatic,
                vtableIndex, usr);
 
 struct CcleRecordInfo {
@@ -185,6 +186,7 @@ void MessageHandler::ccls_dumpTypes(JsonReader &reader, ReplyOnce &reply) {
         CcleMethodInfo mi;
         mi.qualName = std::string(func_def->name(true));
         mi.shortName = std::string(func_def->name(false));
+        mi.signature = std::string(func_def->detailed_name);
         mi.isVirtual = func_def->is_virtual;
         mi.isPure = func_def->is_pure;
         mi.isStatic = func_def->storage == clang::SC_Static;
