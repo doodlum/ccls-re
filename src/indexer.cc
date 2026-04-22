@@ -10,6 +10,7 @@
 #include "sema_manager.hh"
 
 #include <clang/AST/AST.h>
+#include <clang/AST/RecordLayout.h>
 #include <clang/AST/VTableBuilder.h>
 #include <clang/Basic/TargetInfo.h>
 #include <clang/Frontend/FrontendAction.h>
@@ -937,10 +938,9 @@ public:
             }
           // ccls-re: record size, alignment, and vtable presence
           if (defRd->isCompleteDefinition() && !defRd->isDependentType()) {
-            CharUnits size = ctx->getTypeSizeInChars(defRd->getTypeForDecl());
-            type->def.record_size = static_cast<int32_t>(size.getQuantity());
-            CharUnits align = ctx->getTypeAlignInChars(defRd->getTypeForDecl());
-            type->def.record_align = static_cast<int32_t>(align.getQuantity());
+            const auto &layout = ctx->getASTRecordLayout(defRd);
+            type->def.record_size = static_cast<int32_t>(layout.getSize().getQuantity());
+            type->def.record_align = static_cast<int32_t>(layout.getAlignment().getQuantity());
             type->def.has_vtable = defRd->isDynamicClass();
           }
         }
@@ -987,10 +987,9 @@ public:
             if (auto *rd = dyn_cast<RecordDecl>(d)) {
               auto *defRd = rd->getDefinition();
               if (defRd && defRd->isCompleteDefinition() && !defRd->isDependentType()) {
-                CharUnits size = ctx->getTypeSizeInChars(defRd->getTypeForDecl());
-                type->def.record_size = static_cast<int32_t>(size.getQuantity());
-                CharUnits align = ctx->getTypeAlignInChars(defRd->getTypeForDecl());
-                type->def.record_align = static_cast<int32_t>(align.getQuantity());
+                const auto &layout = ctx->getASTRecordLayout(defRd);
+                type->def.record_size = static_cast<int32_t>(layout.getSize().getQuantity());
+                type->def.record_align = static_cast<int32_t>(layout.getAlignment().getQuantity());
               }
             }
           }
@@ -1030,10 +1029,9 @@ public:
           // ccls-re: record size/align/vtable for template specializations
           auto *defRd = rd->getDefinition();
           if (defRd && defRd->isCompleteDefinition() && !defRd->isDependentType()) {
-            CharUnits size = ctx->getTypeSizeInChars(defRd->getTypeForDecl());
-            type->def.record_size = static_cast<int32_t>(size.getQuantity());
-            CharUnits align = ctx->getTypeAlignInChars(defRd->getTypeForDecl());
-            type->def.record_align = static_cast<int32_t>(align.getQuantity());
+            const auto &layout = ctx->getASTRecordLayout(defRd);
+            type->def.record_size = static_cast<int32_t>(layout.getSize().getQuantity());
+            type->def.record_align = static_cast<int32_t>(layout.getAlignment().getQuantity());
             type->def.has_vtable = defRd->isDynamicClass();
           }
           Decl *d1 = nullptr;
