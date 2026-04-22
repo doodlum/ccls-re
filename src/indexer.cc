@@ -10,6 +10,7 @@
 #include "sema_manager.hh"
 
 #include <clang/AST/AST.h>
+#include <clang/AST/VTableBuilder.h>
 #include <clang/Basic/TargetInfo.h>
 #include <clang/Frontend/FrontendAction.h>
 #include <clang/Frontend/MultiplexConsumer.h>
@@ -676,7 +677,7 @@ public:
     }
   }
 
-  void collectRecordMembers(IndexType &type, const RecordDecl *rd) {
+  void collectRecordMembers(IndexType &type, const RecordDecl *rd, IndexFile *db) {
     SmallVector<std::pair<const RecordDecl *, int>, 2> stack{{rd, 0}};
     llvm::DenseSet<const RecordDecl *> seen;
     seen.insert(rd);
@@ -688,9 +689,18 @@ public:
         offset = -1;
       for (FieldDecl *fd : rd->fields()) {
         int offset1 = offset < 0 ? -1 : int(offset + ctx->getFieldOffset(fd));
-        if (fd->getIdentifier())
-          type.def.vars.emplace_back(getUsr(fd), offset1);
-        else if (const auto *rt1 = fd->getType()->getAs<RecordType>()) {
+        if (fd->getIdentifier()) {
+          Usr field_usr = getUsr(fd);
+          type.def.vars.emplace_back(field_usr, offset1);
+          // ccls-re: store qualType string and field size
+          auto &var = db->toVar(field_usr);
+          QualType qt = fd->getType();
+          var.def.type_str = intern(qt.getAsString(ctx->getPrintingPolicy()));
+          if (!qt->isDependentType() && !qt->isIncompleteType()) {
+            CharUnits sz = ctx->getTypeSizeInChars(qt);
+            var.def.type_size = static_cast<int32_t>(sz.getQuantity());
+          }
+        } else if (const auto *rt1 = fd->getType()->getAs<RecordType>()) {
           if (const RecordDecl *rd1 = rt1->getDecl())
             if (seen.insert(rd1).second)
               stack.push_back({rd1, offset1});
@@ -707,7 +717,7 @@ public:
     if (!param.no_linkage) {
       if (auto *nd = dyn_cast<NamedDecl>(d); nd && nd->hasLinkage())
         ;
-      else
+      else if (d->getKind() != Decl::TypeAlias && d->getKind() != Decl::Typedef)
         return true;
     }
     SourceManager &sm = ctx->getSourceManager();
@@ -917,13 +927,23 @@ public:
     case Decl::CXXRecord:
       if (is_def) {
         auto *rd = dyn_cast<CXXRecordDecl>(d);
-        if (rd && rd->hasDefinition())
-          for (const CXXBaseSpecifier &base : rd->bases())
+        if (rd && rd->hasDefinition()) {
+          auto *defRd = rd->getDefinition();
+          for (const CXXBaseSpecifier &base : defRd->bases())
             if (const Decl *baseD = getAdjustedDecl(getTypeDecl(base.getType()))) {
               Usr usr1 = getUsr(baseD);
               type->def.bases.push_back(usr1);
               db->toType(usr1).derived.push_back(usr);
             }
+          // ccls-re: record size, alignment, and vtable presence
+          if (defRd->isCompleteDefinition() && !defRd->isDependentType()) {
+            CharUnits size = ctx->getTypeSizeInChars(defRd->getTypeForDecl());
+            type->def.record_size = static_cast<int32_t>(size.getQuantity());
+            CharUnits align = ctx->getTypeAlignInChars(defRd->getTypeForDecl());
+            type->def.record_align = static_cast<int32_t>(align.getQuantity());
+            type->def.has_vtable = defRd->isDynamicClass();
+          }
+        }
       }
       [[fallthrough]];
     case Decl::Enum:
@@ -959,9 +979,45 @@ public:
             type->def.short_name_size = name.size();
           }
         }
-        if (is_def && !isa<EnumDecl>(d))
+        if (is_def && !isa<EnumDecl>(d)) {
           if (auto *ord = dyn_cast<RecordDecl>(origD))
-            collectRecordMembers(*type, ord);
+            collectRecordMembers(*type, ord, db);
+          // ccls-re: record size/align for C records (non-CXXRecordDecl)
+          if (!isa<CXXRecordDecl>(d)) {
+            if (auto *rd = dyn_cast<RecordDecl>(d)) {
+              auto *defRd = rd->getDefinition();
+              if (defRd && defRd->isCompleteDefinition() && !defRd->isDependentType()) {
+                CharUnits size = ctx->getTypeSizeInChars(defRd->getTypeForDecl());
+                type->def.record_size = static_cast<int32_t>(size.getQuantity());
+                CharUnits align = ctx->getTypeAlignInChars(defRd->getTypeForDecl());
+                type->def.record_align = static_cast<int32_t>(align.getQuantity());
+              }
+            }
+          }
+        }
+        // ccls-re: enum info
+        if (is_def) {
+          if (auto *ed = dyn_cast<EnumDecl>(d)) {
+            type->def.enum_scoped = ed->isScoped();
+            QualType ut = ed->getIntegerType();
+            if (!ut.isNull()) {
+              type->def.enum_underlying_type = intern(ut.getAsString(ctx->getPrintingPolicy()));
+              if (!ut->isDependentType()) {
+                CharUnits sz = ctx->getTypeSizeInChars(ut);
+                type->def.enum_size = static_cast<int32_t>(sz.getQuantity());
+              }
+            }
+            for (const auto *ecd : ed->enumerators()) {
+              const auto &val = ecd->getInitVal();
+              EnumValue ev;
+              ev.name = intern(ecd->getName());
+              ev.value = val.isSigned() ? val.getSExtValue()
+                                        : static_cast<int64_t>(val.getZExtValue());
+              ev.is_unsigned = val.isUnsigned();
+              type->def.enum_values.emplace_back(ev);
+            }
+          }
+        }
       }
       break;
     case Decl::ClassTemplateSpecialization:
@@ -969,8 +1025,17 @@ public:
       type->def.kind = SymbolKind::Class;
       if (is_def) {
         if (auto *ord = dyn_cast<RecordDecl>(origD))
-          collectRecordMembers(*type, ord);
+          collectRecordMembers(*type, ord, db);
         if (auto *rd = dyn_cast<CXXRecordDecl>(d)) {
+          // ccls-re: record size/align/vtable for template specializations
+          auto *defRd = rd->getDefinition();
+          if (defRd && defRd->isCompleteDefinition() && !defRd->isDependentType()) {
+            CharUnits size = ctx->getTypeSizeInChars(defRd->getTypeForDecl());
+            type->def.record_size = static_cast<int32_t>(size.getQuantity());
+            CharUnits align = ctx->getTypeAlignInChars(defRd->getTypeForDecl());
+            type->def.record_align = static_cast<int32_t>(align.getQuantity());
+            type->def.has_vtable = defRd->isDynamicClass();
+          }
           Decl *d1 = nullptr;
           if (auto *sd = dyn_cast<ClassTemplatePartialSpecializationDecl>(rd))
             d1 = sd->getSpecializedTemplate();
@@ -1005,6 +1070,7 @@ public:
       if (auto *td = dyn_cast<TypedefNameDecl>(d)) {
         bool specialization = false;
         QualType t = td->getUnderlyingType();
+        type->def.typedef_underlying = intern(t.getAsString());
         if (const Decl *d1 = getAdjustedDecl(getTypeDecl(t, &specialization))) {
           Usr usr1 = getUsr(d1);
           IndexType &type1 = db->toType(usr1);
@@ -1028,6 +1094,30 @@ public:
             Usr usr1 = getUsr(nd1);
             func->def.bases.push_back(usr1);
             db->toFunc(usr1).derived.push_back(usr);
+          }
+        }
+        // ccls-re: capture virtual method info and vtable slot index
+        if (auto *md = dyn_cast<CXXMethodDecl>(d)) {
+          if (md->isVirtual()) {
+            func->def.is_virtual = true;
+            func->def.is_pure = md->isPureVirtual();
+            // Try to get vtable slot index via the VTable context
+            if (md->getParent() && md->getParent()->isCompleteDefinition() &&
+                !md->getParent()->isDependentType()) {
+              VTableContextBase *vtableCtxBase = ctx->getVTableContext();
+              if (auto *msCtx = dyn_cast<MicrosoftVTableContext>(vtableCtxBase)) {
+                // MSVC ABI (CommonLibSSE target)
+                MethodVFTableLocation loc = msCtx->getMethodVFTableLocation(
+                    GlobalDecl(md));
+                func->def.vtable_index = static_cast<int32_t>(loc.Index);
+              } else if (auto *itCtx = dyn_cast<ItaniumVTableContext>(vtableCtxBase)) {
+                // Itanium ABI fallback
+                if (md->isVirtual()) {
+                  uint64_t idx = itCtx->getMethodVTableIndex(GlobalDecl(md));
+                  func->def.vtable_index = static_cast<int32_t>(idx);
+                }
+              }
+            }
           }
         }
       }
@@ -1189,7 +1279,7 @@ public:
 };
 } // namespace
 
-const int IndexFile::kMajorVersion = 21;
+const int IndexFile::kMajorVersion = 22;
 const int IndexFile::kMinorVersion = 0;
 
 IndexFile::IndexFile(const std::string &path, const std::string &contents, bool no_linkage)

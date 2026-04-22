@@ -36,6 +36,7 @@ if(MSVC)
   target_compile_options(ccls PRIVATE
     /nologo
     /EHsc
+    /MT
     /D_CRT_SECURE_NO_WARNINGS # don't try to use MSVC std replacements
     /W3 # roughly -Wall
     /wd4996 # ignore deprecated declaration
@@ -219,6 +220,7 @@ target_sources(ccls PRIVATE
 )
 
 target_sources(ccls PRIVATE
+  src/messages/ccls_dumpTypes.cc
   src/messages/ccls_call.cc
   src/messages/ccls_info.cc
   src/messages/ccls_inheritance.cc

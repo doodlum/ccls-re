@@ -264,6 +264,8 @@ private:
   void ccls_navigate(JsonReader &, ReplyOnce &);
   void ccls_reload(JsonReader &);
   void ccls_vars(JsonReader &, ReplyOnce &);
+  // ccls-re custom extensions
+  void ccls_dumpTypes(JsonReader &, ReplyOnce &);
   void callHierarchy_incomingCalls(CallsParam &param, ReplyOnce &);
   void callHierarchy_outgoingCalls(CallsParam &param, ReplyOnce &);
   void exit(EmptyParam &);

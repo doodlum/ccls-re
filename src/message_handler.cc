@@ -162,6 +162,7 @@ void MessageHandler::bind(const char *method, void (MessageHandler::*handler)(Pa
 
 MessageHandler::MessageHandler() {
   // clang-format off
+  bind("$ccls/dumpTypes", &MessageHandler::ccls_dumpTypes);
   bind("$ccls/call", &MessageHandler::ccls_call);
   bind("$ccls/fileInfo", &MessageHandler::ccls_fileInfo);
   bind("$ccls/info", &MessageHandler::ccls_info);

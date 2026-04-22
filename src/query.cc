@@ -88,6 +88,10 @@ QueryFunc::Def convert(const IndexFunc::Def &o) {
   r.kind = o.kind;
   r.parent_kind = o.parent_kind;
   r.storage = o.storage;
+  // ccls-re extensions
+  r.vtable_index = o.vtable_index;
+  r.is_virtual = o.is_virtual;
+  r.is_pure = o.is_pure;
   return r;
 }
 
@@ -108,6 +112,15 @@ QueryType::Def convert(const IndexType::Def &o) {
   r.short_name_size = o.short_name_size;
   r.kind = o.kind;
   r.parent_kind = o.parent_kind;
+  // ccls-re extensions
+  r.record_size = o.record_size;
+  r.record_align = o.record_align;
+  r.has_vtable = o.has_vtable;
+  r.typedef_underlying = o.typedef_underlying;
+  r.enum_size = o.enum_size;
+  r.enum_scoped = o.enum_scoped;
+  r.enum_underlying_type = o.enum_underlying_type;
+  r.enum_values = convert(o.enum_values);
   return r;
 }
 

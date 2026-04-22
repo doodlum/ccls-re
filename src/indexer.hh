@@ -157,11 +157,17 @@ template <template <typename T> class V> struct FuncDef : NameMixin<FuncDef<V>> 
   SymbolKind parent_kind = SymbolKind::Unknown;
   uint8_t storage = clang::SC_None;
 
+  // ccls-re extensions: virtual method info
+  int32_t vtable_index = -1; // -1 = not virtual
+  bool is_virtual = false;
+  bool is_pure = false;
+
   const Usr *bases_begin() const { return bases.begin(); }
   const Usr *bases_end() const { return bases.end(); }
 };
 REFLECT_STRUCT(FuncDef<VectorAdapter>, detailed_name, hover, comments, spell, bases, vars, callees, qual_name_offset,
-               short_name_offset, short_name_size, kind, parent_kind, storage);
+               short_name_offset, short_name_size, kind, parent_kind, storage,
+               vtable_index, is_virtual, is_pure);
 
 struct IndexFunc : NameMixin<IndexFunc> {
   using Def = FuncDef<VectorAdapter>;
@@ -171,6 +177,14 @@ struct IndexFunc : NameMixin<IndexFunc> {
   std::vector<Usr> derived;
   std::vector<Use> uses;
 };
+
+// ccls-re extension: structured enum constant value
+struct EnumValue {
+  const char *name = "";
+  int64_t value = 0;
+  bool is_unsigned = false;
+};
+REFLECT_STRUCT(EnumValue, name, value, is_unsigned);
 
 template <template <typename T> class V> struct TypeDef : NameMixin<TypeDef<V>> {
   const char *detailed_name = "";
@@ -194,11 +208,26 @@ template <template <typename T> class V> struct TypeDef : NameMixin<TypeDef<V>> 
   SymbolKind kind = SymbolKind::Unknown;
   SymbolKind parent_kind = SymbolKind::Unknown;
 
+  // ccls-re extensions: record layout info
+  int32_t record_size = -1;  // bytes, -1 = unknown
+  int32_t record_align = -1; // bytes
+  bool has_vtable = false;
+
+  // ccls-re extensions: typedef info
+  const char *typedef_underlying = "";  // qualType string of underlying type
+
+  // ccls-re extensions: enum info
+  int32_t enum_size = -1;                  // bytes
+  bool enum_scoped = false;
+  const char *enum_underlying_type = "";   // e.g. "unsigned int"
+  V<EnumValue> enum_values;
+
   const Usr *bases_begin() const { return bases.begin(); }
   const Usr *bases_end() const { return bases.end(); }
 };
 REFLECT_STRUCT(TypeDef<VectorAdapter>, detailed_name, hover, comments, spell, bases, funcs, types, vars, alias_of,
-               qual_name_offset, short_name_offset, short_name_size, kind, parent_kind);
+               qual_name_offset, short_name_offset, short_name_size, kind, parent_kind,
+               record_size, record_align, has_vtable, typedef_underlying, enum_size, enum_scoped, enum_underlying_type, enum_values);
 
 struct IndexType {
   using Def = TypeDef<VectorAdapter>;
@@ -229,6 +258,10 @@ struct VarDef : NameMixin<VarDef> {
   // (declaration).
   uint8_t storage = clang::SC_None;
 
+  // ccls-re extensions: field type info
+  const char *type_str = "";  // qualType string e.g. "RE::AIProcess *"
+  int32_t type_size = -1;     // bytes, -1 = unknown
+
   bool is_local() const {
     return spell &&
            (parent_kind == SymbolKind::Function || parent_kind == SymbolKind::Method ||
@@ -240,7 +273,7 @@ struct VarDef : NameMixin<VarDef> {
   const Usr *bases_end() const { return nullptr; }
 };
 REFLECT_STRUCT(VarDef, detailed_name, hover, comments, spell, type, qual_name_offset, short_name_offset,
-               short_name_size, kind, parent_kind, storage);
+               short_name_size, kind, parent_kind, storage, type_str, type_size);
 
 struct IndexVar {
   using Def = VarDef;
