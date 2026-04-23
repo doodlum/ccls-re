@@ -13,8 +13,10 @@
 #include <clang/AST/RecordLayout.h>
 #include <clang/AST/VTableBuilder.h>
 #include <clang/Basic/TargetInfo.h>
+#include <clang/Frontend/CompilerInstance.h>
 #include <clang/Frontend/FrontendAction.h>
 #include <clang/Frontend/MultiplexConsumer.h>
+#include <clang/Sema/Sema.h>
 #include <clang/Index/IndexDataConsumer.h>
 #include <clang/Index/IndexingAction.h>
 #include <clang/Index/USRGeneration.h>
@@ -62,6 +64,7 @@ struct IndexParam {
 
   VFS &vfs;
   ASTContext *ctx;
+  Sema *sema = nullptr;
   bool no_linkage;
   IndexParam(VFS &vfs, bool no_linkage) : vfs(vfs), no_linkage(no_linkage) {}
 
@@ -718,13 +721,9 @@ public:
         qualified += argsStr;
       }
 
-      // Find short name within qualified (everything after last ::)
-      auto lastColon = qualified.rfind("::");
-      int16_t sno = (lastColon != std::string::npos) ? static_cast<int16_t>(lastColon + 2) : 0;
-
       type.def.qual_name_offset = 0;
-      type.def.short_name_offset = sno;
-      type.def.short_name_size = static_cast<int16_t>(qualified.size() - sno);
+      type.def.short_name_offset = 0;
+      type.def.short_name_size = static_cast<int16_t>(qualified.size());
       type.def.detailed_name = intern(qualified);
     }
 
@@ -850,18 +849,23 @@ public:
   }
 
   void maybeIndexFieldTemplateSpec(QualType qt, IndexFile *db) {
-    QualType desugar = qt.getDesugaredType(*ctx);
-    // Strip pointers/references
-    while (desugar->isPointerType() || desugar->isReferenceType())
-      desugar = desugar->getPointeeType().getDesugaredType(*ctx);
-    // Strip arrays
-    while (const auto *arr = dyn_cast<ConstantArrayType>(desugar))
-      desugar = arr->getElementType().getDesugaredType(*ctx);
+    QualType canon = qt.getCanonicalType();
+    while (canon->isPointerType() || canon->isReferenceType())
+      canon = canon->getPointeeType().getCanonicalType();
+    while (const auto *arr = dyn_cast<ConstantArrayType>(canon))
+      canon = arr->getElementType().getCanonicalType();
 
-    if (const auto *rt = desugar->getAs<RecordType>()) {
-      if (const auto *spec = dyn_cast<ClassTemplateSpecializationDecl>(rt->getDecl())) {
+    if (const auto *rt = canon->getAs<RecordType>()) {
+      if (auto *spec = dyn_cast<ClassTemplateSpecializationDecl>(rt->getDecl())) {
         if (!spec->isExplicitSpecialization()) {
           auto *def = spec->getDefinition();
+          if (!def && !spec->isDependentType() && param.sema) {
+            param.sema->InstantiateClassTemplateSpecialization(
+                spec->getLocation(),
+                const_cast<ClassTemplateSpecializationDecl *>(spec),
+                TSK_ImplicitInstantiation, false, false);
+            def = spec->getDefinition();
+          }
           if (def && def->isCompleteDefinition() && !def->isDependentType())
             indexTemplateSpec(spec, db);
         }
@@ -906,6 +910,24 @@ public:
 public:
   IndexDataConsumer(IndexParam &param) : param(param) {}
   void initialize(ASTContext &ctx) override { this->ctx = param.ctx = &ctx; }
+
+  void indexForceInstantiatedSpecs(ArrayRef<const Decl *> decls) {
+    SourceManager &sm = ctx->getSourceManager();
+    int indexed = 0;
+    for (const auto *d : decls) {
+      auto *spec = dyn_cast<ClassTemplateSpecializationDecl>(d);
+      if (!spec) continue;
+      auto *def = spec->getDefinition();
+      if (!def || !def->isCompleteDefinition() || def->isDependentType()) continue;
+      FileID fid = sm.getFileID(sm.getExpansionLoc(spec->getLocation()));
+      IndexFile *db = param.consumeFile(fid);
+      if (!db) continue;
+      indexTemplateSpec(spec, db);
+      indexed++;
+    }
+    fprintf(stderr, "[ccls-re] indexForceInstantiatedSpecs: %d of %d indexed\n",
+            indexed, (int)decls.size());
+  }
   bool handleDeclOccurrence(const Decl *d, index::SymbolRoleSet roles, ArrayRef<index::SymbolRelation> relations,
                             SourceLocation src_loc, ASTNodeInfo ast_node) override {
     if (!param.no_linkage) {
@@ -1216,8 +1238,17 @@ public:
     case Decl::ClassTemplatePartialSpecialization:
       type->def.kind = SymbolKind::Class;
       if (is_def) {
-        if (auto *ord = dyn_cast<RecordDecl>(origD))
-          collectRecordMembers(*type, ord, db);
+        {
+          auto *specRd = dyn_cast<CXXRecordDecl>(origD);
+          const RecordDecl *memberRd = specRd;
+          if (specRd) {
+            auto *defRd = specRd->getDefinition();
+            if (defRd && defRd->isCompleteDefinition() && !defRd->isDependentType())
+              memberRd = defRd;
+          }
+          if (memberRd)
+            collectRecordMembers(*type, memberRd, db);
+        }
         if (auto *rd = dyn_cast<CXXRecordDecl>(d)) {
           // ccls-re: record size/align/vtable for template specializations
           auto *defRd = rd->getDefinition();
@@ -1426,6 +1457,70 @@ public:
   }
 };
 
+// Force-instantiate implicit template specializations that were only used
+// behind pointers/references so the indexer can capture their layouts.
+// Runs multiple passes: instantiating one template may create new CTSDs
+// for types used in its fields (e.g., NiTListItem<T> inside NiTListBase<A,T>).
+class ForceTemplateInstantiator : public ASTConsumer {
+  CompilerInstance &ci;
+  IndexParam &param;
+  std::shared_ptr<IndexDataConsumer> dataConsumer;
+
+  llvm::DenseSet<const Decl *> seen;
+  SmallVector<const Decl *, 256> instantiated;
+
+  int tryInstantiate(ClassTemplateSpecializationDecl *ctsd) {
+    if (ctsd->getDefinition()) return 0;
+    if (ctsd->isDependentType()) return 0;
+    if (ctsd->getSpecializationKind() != TSK_ImplicitInstantiation &&
+        ctsd->getSpecializationKind() != TSK_Undeclared) return 0;
+    auto &sema = ci.getSema();
+    bool failed = sema.InstantiateClassTemplateSpecialization(
+        ctsd->getLocation(), ctsd,
+        TSK_ImplicitInstantiation, false, false);
+    if (!failed && ctsd->getDefinition()) {
+      instantiated.push_back(ctsd);
+      return 1;
+    }
+    return 0;
+  }
+
+  int walkPass(DeclContext *dc) {
+    int newInsts = 0;
+    for (auto *d : dc->decls()) {
+      if (auto *ctd = dyn_cast<ClassTemplateDecl>(d)) {
+        for (auto *spec : ctd->specializations()) {
+          if (seen.insert(spec).second)
+            newInsts += tryInstantiate(spec);
+        }
+      }
+      if (auto *dc2 = dyn_cast<DeclContext>(d))
+        newInsts += walkPass(dc2);
+    }
+    return newInsts;
+  }
+
+public:
+  ForceTemplateInstantiator(CompilerInstance &ci, IndexParam &param,
+                            std::shared_ptr<IndexDataConsumer> dc)
+      : ci(ci), param(param), dataConsumer(std::move(dc)) {}
+  void HandleTranslationUnit(ASTContext &ctx) override {
+    param.sema = &ci.getSema();
+    int pass = 0, totalInst = 0;
+    int newInsts;
+    do {
+      pass++;
+      newInsts = walkPass(ctx.getTranslationUnitDecl());
+      totalInst += newInsts;
+    } while (newInsts > 0 && pass < 10);
+    fprintf(stderr, "[ccls-re] ForceTemplateInstantiator: %d passes, %d specs seen, %d instantiated\n",
+            pass, (int)seen.size(), totalInst);
+
+    if (!instantiated.empty())
+      dataConsumer->indexForceInstantiatedSpecs(instantiated);
+  }
+};
+
 class IndexFrontendAction : public ASTFrontendAction {
   std::shared_ptr<IndexDataConsumer> dataConsumer;
   const index::IndexingOptions &indexOpts;
@@ -1453,6 +1548,7 @@ public:
     std::shared_ptr<Preprocessor> pp = ci.getPreprocessorPtr();
     pp->addPPCallbacks(std::make_unique<IndexPPCallbacks>(pp->getSourceManager(), param));
     std::vector<std::unique_ptr<ASTConsumer>> consumers;
+    consumers.push_back(std::make_unique<ForceTemplateInstantiator>(ci, param, dataConsumer));
     consumers.push_back(std::make_unique<SkipProcessed>(param));
     consumers.push_back(index::createIndexingASTConsumer(dataConsumer, indexOpts, std::move(pp)));
     return std::make_unique<MultiplexConsumer>(std::move(consumers));
