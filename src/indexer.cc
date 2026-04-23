@@ -678,6 +678,197 @@ public:
     }
   }
 
+  // ccls-re: Track template specializations already indexed to avoid
+  // infinite recursion with nested templates.
+  llvm::DenseSet<const Decl *> indexedTemplateSpecs;
+
+  void indexTemplateSpec(const ClassTemplateSpecializationDecl *spec, IndexFile *db) {
+    auto *defRd = spec->getDefinition();
+    if (!defRd)
+      defRd = const_cast<CXXRecordDecl *>(static_cast<const CXXRecordDecl *>(spec));
+    if (!defRd->isCompleteDefinition() || defRd->isDependentType())
+      return;
+    const Decl *canon = spec->getCanonicalDecl();
+    if (!indexedTemplateSpecs.insert(canon).second)
+      return;
+
+    // Get the specialization's own USR (not adjusted to template)
+    SmallString<256> usrBuf;
+    index::generateUSRForDecl(canon, usrBuf);
+    Usr usr = hashUsr(usrBuf);
+
+    IndexType &type = db->toType(usr);
+    type.usr = usr;
+    type.def.kind = SymbolKind::Class;
+
+    // Set name: use printQualifiedName for the specialization
+    if (type.def.detailed_name[0] == '\0') {
+      std::string qualified;
+      llvm::raw_string_ostream os(qualified);
+      spec->printQualifiedName(os, getDefaultPolicy());
+      simplifyAnonymous(qualified);
+
+      // Append template args if not already present
+      if (qualified.find('<') == std::string::npos) {
+        std::string argsStr;
+        llvm::raw_string_ostream argOs(argsStr);
+        const auto &args = spec->getTemplateArgs();
+        clang::printTemplateArgumentList(argOs, args.asArray(),
+                                         ctx->getPrintingPolicy());
+        qualified += argsStr;
+      }
+
+      // Find short name within qualified (everything after last ::)
+      auto lastColon = qualified.rfind("::");
+      int16_t sno = (lastColon != std::string::npos) ? static_cast<int16_t>(lastColon + 2) : 0;
+
+      type.def.qual_name_offset = 0;
+      type.def.short_name_offset = sno;
+      type.def.short_name_size = static_cast<int16_t>(qualified.size() - sno);
+      type.def.detailed_name = intern(qualified);
+    }
+
+    // Record layout
+    const auto &layout = ctx->getASTRecordLayout(defRd);
+    type.def.record_size = static_cast<int32_t>(layout.getSize().getQuantity());
+    type.def.record_align = static_cast<int32_t>(layout.getAlignment().getQuantity());
+    type.def.has_vtable = defRd->isDynamicClass();
+
+    // Bases
+    if (auto *cxxRd = dyn_cast<CXXRecordDecl>(defRd)) {
+      for (const CXXBaseSpecifier &base : cxxRd->bases()) {
+        QualType bt = base.getType();
+        if (const auto *rt = bt->getAs<RecordType>()) {
+          if (const auto *baseSpec = dyn_cast<ClassTemplateSpecializationDecl>(rt->getDecl())) {
+            indexTemplateSpec(baseSpec, db);
+            SmallString<256> baseUsrBuf;
+            index::generateUSRForDecl(baseSpec->getCanonicalDecl(), baseUsrBuf);
+            Usr baseUsr = hashUsr(baseUsrBuf);
+            type.def.bases.push_back(baseUsr);
+          } else if (const Decl *baseD = getAdjustedDecl(rt->getDecl())) {
+            type.def.bases.push_back(getUsr(baseD));
+          }
+        }
+      }
+    }
+
+    // Collect all fields (own + inherited) with absolute offsets.
+    // Walk base classes recursively, adding base offset to each field.
+    {
+      struct RecordWalk { const CXXRecordDecl *rd; int64_t baseOffset; };
+      SmallVector<RecordWalk, 4> worklist;
+      worklist.push_back({dyn_cast<CXXRecordDecl>(defRd), 0});
+
+      while (!worklist.empty()) {
+        auto [walkRd, walkBase] = worklist.pop_back_val();
+        if (!walkRd || !walkRd->isCompleteDefinition() || walkRd->isDependentType())
+          continue;
+
+        const auto &walkLayout = ctx->getASTRecordLayout(walkRd);
+
+        // Enqueue base classes with their offsets
+        for (const auto &base : walkRd->bases()) {
+          if (const auto *rt = base.getType()->getAs<RecordType>()) {
+            if (auto *baseRd = dyn_cast<CXXRecordDecl>(rt->getDecl())) {
+              auto *baseDef = baseRd->getDefinition();
+              if (baseDef) {
+                CharUnits baseOff = walkLayout.getBaseClassOffset(baseDef);
+                worklist.push_back({baseDef, walkBase + baseOff.getQuantity() * 8});
+              }
+            }
+          }
+        }
+
+        // Collect direct fields of this record
+        for (FieldDecl *fd : walkRd->fields()) {
+          if (!fd->getIdentifier())
+            continue;
+          QualType qt = fd->getType();
+          std::string fieldName = fd->getNameAsString();
+
+          SmallString<256> fieldUsrBuf;
+          fieldUsrBuf.append(usrBuf);
+          fieldUsrBuf.push_back('#');
+          fieldUsrBuf.append(fieldName);
+          Usr fieldUsr = hashUsr(fieldUsrBuf);
+
+          int64_t offsetBits = walkBase + ctx->getFieldOffset(fd);
+          type.def.vars.emplace_back(fieldUsr, offsetBits);
+
+          auto &var = db->toVar(fieldUsr);
+          var.usr = fieldUsr;
+          var.def.kind = SymbolKind::Field;
+          if (var.def.detailed_name[0] == '\0') {
+            var.def.detailed_name = intern(fieldName);
+            var.def.short_name_offset = 0;
+            var.def.short_name_size = fieldName.size();
+          }
+          var.def.type_str = intern(qt.getAsString(ctx->getPrintingPolicy()));
+          if (!qt->isDependentType() && !qt->isIncompleteType()) {
+            CharUnits sz = ctx->getTypeSizeInChars(qt);
+            var.def.type_size = static_cast<int32_t>(sz.getQuantity());
+          }
+          maybeIndexFieldTemplateSpec(qt, db);
+        }
+      }
+    }
+
+    // Methods
+    if (auto *cxxRd = dyn_cast<CXXRecordDecl>(defRd)) {
+      for (auto *method : cxxRd->methods()) {
+        if (method->isImplicit())
+          continue;
+        Usr func_usr = getUsr(method);
+        type.def.funcs.push_back(func_usr);
+        auto &func = db->toFunc(func_usr);
+        if (func.def.detailed_name[0] == '\0') {
+          std::string fname;
+          llvm::raw_string_ostream fos(fname);
+          method->printQualifiedName(fos, getDefaultPolicy());
+          func.def.detailed_name = intern(fname);
+          func.def.short_name_offset = 0;
+          func.def.short_name_size = method->getNameAsString().size();
+
+          // Signature (detailed_name for dumpTypes)
+          std::string sig;
+          llvm::raw_string_ostream sos(sig);
+          method->print(sos, getDefaultPolicy());
+          func.def.detailed_name = intern(sig);
+        }
+        func.def.kind = method->isStatic() ? SymbolKind::StaticMethod : SymbolKind::Method;
+        func.def.is_virtual = method->isVirtual();
+        func.def.is_pure = method->isPureVirtual();
+        func.def.storage = method->getStorageClass();
+      }
+    }
+
+    // Link to base template
+    if (auto *ctd = spec->getSpecializedTemplate()) {
+      Usr tmplUsr = getUsr(ctd);
+      db->toType(tmplUsr).derived.push_back(usr);
+    }
+  }
+
+  void maybeIndexFieldTemplateSpec(QualType qt, IndexFile *db) {
+    QualType desugar = qt.getDesugaredType(*ctx);
+    // Strip pointers/references
+    while (desugar->isPointerType() || desugar->isReferenceType())
+      desugar = desugar->getPointeeType().getDesugaredType(*ctx);
+    // Strip arrays
+    while (const auto *arr = dyn_cast<ConstantArrayType>(desugar))
+      desugar = arr->getElementType().getDesugaredType(*ctx);
+
+    if (const auto *rt = desugar->getAs<RecordType>()) {
+      if (const auto *spec = dyn_cast<ClassTemplateSpecializationDecl>(rt->getDecl())) {
+        if (!spec->isExplicitSpecialization()) {
+          auto *def = spec->getDefinition();
+          if (def && def->isCompleteDefinition() && !def->isDependentType())
+            indexTemplateSpec(spec, db);
+        }
+      }
+    }
+  }
+
   void collectRecordMembers(IndexType &type, const RecordDecl *rd, IndexFile *db) {
     SmallVector<std::pair<const RecordDecl *, int>, 2> stack{{rd, 0}};
     llvm::DenseSet<const RecordDecl *> seen;
@@ -701,6 +892,8 @@ public:
             CharUnits sz = ctx->getTypeSizeInChars(qt);
             var.def.type_size = static_cast<int32_t>(sz.getQuantity());
           }
+          // ccls-re: index template specializations used as field types
+          maybeIndexFieldTemplateSpec(fd->getType(), db);
         } else if (const auto *rt1 = fd->getType()->getAs<RecordType>()) {
           if (const RecordDecl *rd1 = rt1->getDecl())
             if (seen.insert(rd1).second)
